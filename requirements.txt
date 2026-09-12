@@ -1,0 +1,7 @@
+streamlit
+google-generativeai
+docx2txt
+docxtpl
+openpyxl
+pypdf
+python-docx
