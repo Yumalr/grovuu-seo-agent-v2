@@ -1,7 +1,9 @@
 streamlit
-google-generativeai
+google-genai
 docx2txt
 docxtpl
 openpyxl
 pypdf
 python-docx
+httpx
+beautifulsoup4

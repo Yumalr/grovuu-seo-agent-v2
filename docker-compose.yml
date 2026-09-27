@@ -1,0 +1,9 @@
+version: '3.8'
+services:
+  grovuu-seo-agent:
+    build: .
+    ports:
+      - "8501:8501"
+    volumes:
+      - ./.streamlit/secrets.toml:/app/.streamlit/secrets.toml:ro
+    restart: always

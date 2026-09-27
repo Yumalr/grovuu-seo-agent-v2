@@ -1,409 +1,443 @@
+"""Grovuu SEO Agent v2 — Evidence-based SEO Agent with chat interface.
+
+Architecture:
+  User -> Chat interface -> Gemini (with SEO Skill system prompt)
+       -> MCP evidence tools (inspect_page, etc.)
+       -> Structured findings with evidence status labels
+       -> Downloadable HTML/DOCX/XLSX reports
+"""
+
 import io
 import json
 import os
-import zipfile
 import time
+import zipfile
+import pickle
+
 import streamlit as st
-import google.generativeai as genai
-from google.api_core import exceptions as google_exceptions
-from docxtpl import DocxTemplate
-from openpyxl import Workbook
-from openpyxl.styles import Font, Alignment, PatternFill
-import docx2txt
-from pypdf import PdfReader
+from google import genai
+from google.genai import types
 
-# Configure Streamlit page
-st.set_page_config(page_title="SEO Strategy Agent", layout="centered")
+from agent.prompts import build_system_prompt
+from agent.core import TOOL_DECLARATIONS, execute_tool_call
+from agent.strategy import (
+    assembly_pass,
+    validate_plan,
+    content_pass,
+)
+from reports.html_report import generate_audit_report
+from reports.strategy_docx import render_docx
+from reports.meta_xlsx import render_excel_meta
+from utils import extract_text
 
-# Configure Gemini
-api_key = os.getenv("GEMINI_API_KEY")
+
+# ──────────────────────────────────────────────────────────────────
+# Page config
+# ──────────────────────────────────────────────────────────────────
+st.set_page_config(
+    page_title="Grovuu SEO Agent",
+    page_icon="🔍",
+    layout="wide",
+)
+
+st.markdown(
+    """
+<style>
+    [data-testid="stSidebar"] { min-width: 320px; }
+    .stChatMessage { max-width: 900px; }
+    div[data-testid="stStatusWidget"] { max-width: 900px; }
+</style>
+""",
+    unsafe_allow_html=True,
+)
+
+
+# ──────────────────────────────────────────────────────────────────
+# API key + client
+# ──────────────────────────────────────────────────────────────────
+api_key = os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
 if not api_key:
     try:
-        api_key = st.secrets.get("GEMINI_API_KEY")
-    except:
+        api_key = st.secrets.get("GEMINI_API_KEY") or st.secrets.get("GOOGLE_API_KEY")
+    except Exception:
         pass
 if not api_key:
-    st.error("GEMINI_API_KEY is not set.")
+    st.error("Set GEMINI_API_KEY (or GOOGLE_API_KEY) in your environment or .streamlit/secrets.toml")
     st.stop()
 
-genai.configure(api_key=api_key)
-model_name = os.getenv("GEMINI_MODEL", "gemini-3.5-flash")
-model = genai.GenerativeModel(model_name)
+MODEL_NAME = os.getenv("GEMINI_MODEL", "gemini-3.8-flash")
 
-META_COLUMNS = [
-    "#", "Page Name", "URL", "Meta Title",
-    "Meta Description", "H1 (On-Page)", "Primary Keywords", "Search Intent"
-]
 
-DOCX_TEMPLATE_PATH = "template.docx"
+@st.cache_resource
+def get_client():
+    return genai.Client(api_key=api_key)
 
-def generate_with_retry(prompt, config=None, retries=3):
-    """Wrapper to handle 429 Too Many Requests (Rate Limits) gracefully."""
-    for attempt in range(retries):
+
+@st.cache_resource
+def get_system_prompt():
+    return build_system_prompt()
+
+
+client = get_client()
+system_prompt = get_system_prompt()
+
+
+# ──────────────────────────────────────────────────────────────────
+# Session state
+# ──────────────────────────────────────────────────────────────────
+STATE_FILE = "chat_history.pkl"
+
+defaults = {
+    "messages": [],           # Display history: [{"role": ..., "content": ...}]
+    "genai_history": [],      # Gemini Content history for context continuity
+    "last_inspection": None,  # Last inspect_page result for report download
+    "uploaded_text": None,
+    "uploaded_filename": None,
+    "needs_response": False,
+    "strategy_docx": None,
+    "strategy_xlsx": None,
+    "strategy_zip": None,
+    "_run_strategy": False,
+}
+
+def save_state():
+    state_to_save = {k: st.session_state[k] for k in defaults.keys()}
+    try:
+        with open(STATE_FILE, "wb") as f:
+            pickle.dump(state_to_save, f)
+    except Exception as e:
+        print(f"Could not save state: {e}")
+
+if "messages" not in st.session_state:
+    if os.path.exists(STATE_FILE):
         try:
-            if config:
-                return model.generate_content(prompt, generation_config=config)
-            else:
-                return model.generate_content(prompt)
-        except google_exceptions.ResourceExhausted as e:
-            if attempt < retries - 1:
-                print(f"Rate limit hit (429). Retrying in 60 seconds... (Attempt {attempt+1}/{retries})")
-                time.sleep(60)
-            else:
-                raise e
-        except Exception as e:
-            if attempt < retries - 1 and "429" in str(e):
-                print(f"Rate limit hit. Retrying in 60 seconds... (Attempt {attempt+1}/{retries})")
-                time.sleep(60)
-            else:
-                raise e
-
-def extract_text(uploaded_file) -> str:
-    from io import BytesIO
-    from docx import Document
-    ext = os.path.splitext(uploaded_file.name)[1].lower()
-    file_bytes = uploaded_file.getvalue()
-    if ext == ".pdf":
-        reader = PdfReader(BytesIO(file_bytes))
-        pages = [page.extract_text() or "" for page in reader.pages]
-        return "\n\n".join(pages)
-    elif ext == ".docx":
-        document = Document(BytesIO(file_bytes))
-        parts = []
-        for paragraph in document.paragraphs:
-            if paragraph.text.strip():
-                parts.append(paragraph.text.strip())
-        for table in document.tables:
-            for row in table.rows:
-                parts.append(" | ".join(cell.text.strip() for cell in row.cells))
-        return "\n".join(parts)
-    elif ext in {".txt", ".md"}:
-        return file_bytes.decode("utf-8", errors="replace")
+            with open(STATE_FILE, "rb") as f:
+                loaded = pickle.load(f)
+            for k, v in loaded.items():
+                st.session_state[k] = v
+        except Exception:
+            for key, val in defaults.items():
+                st.session_state[key] = val
     else:
-        raise ValueError(f"Unsupported file type: {ext}")
+        for key, val in defaults.items():
+            st.session_state[key] = val
+else:
+    for key, val in defaults.items():
+        if key not in st.session_state:
+            st.session_state[key] = val
 
-def research_pass(brief_text: str, extra_requirements: str) -> str:
-    """Long-form reasoning. No JSON constraint here — the goal is extreme depth and quality."""
-    print("Starting research_pass...")
-    system = (
-        "You are a senior SEO strategist at a boutique consultancy, writing a "
-        "market-entry SEO strategy for a client. You are not a generic copywriter.\n\n"
-        "CONTENT & TONE STANDARD:\n"
-        "- Write in a highly human-centric, professional B2B agency tone. Use clear, direct language.\n"
-        "- Strictly avoid generic AI buzzwords (e.g., 'delve', 'testament', 'revolutionize', 'landscape', 'unlock').\n"
-        "- Do not use robotic transitions. Write as if a senior marketing strategist is speaking directly to a client.\n\n"
-        "STRATEGY REQUIREMENTS:\n"
-        "- Think through the client's Ideal Customer Profiles (ICPs) and provide real example search terms they use.\n"
-        "- Detail why a 'flat' website structure fails (e.g., general 'international' pages cannot rank against specialized competitors).\n"
-        "- Propose a 'Hub-and-Spoke' architecture for this business (Country Hubs, Service Hubs, Area Pages, and Service×Location Spokes) to capture long-tail, high-intent keywords.\n"
-        "- Propose a Phasing strategy using a 'Pilot, Scale, Park' risk-management methodology (Scale = confident demand, Pilot = test demand, Park = consolidate due to low demand).\n"
-        "Write this as a thorough, deep internal strategy memo."
-    )
-    user = f"CLIENT BRIEF:\n{brief_text}\n\nEXTRA REQUIREMENTS:\n{extra_requirements or 'None'}"
-    
-    prompt = f"{system}\n\n{user}"
-    print("Calling Gemini API for research_pass...")
-    resp = generate_with_retry(prompt)
-    print("research_pass complete.")
-    return resp.text
 
-def assembly_pass(brief_text: str, research_memo: str) -> dict:
-    """Structures the research memo into the exact schema the templates need."""
-    print("Starting assembly_pass...")
-    system = (
-        "You convert a strategist's research memo into a structured JSON object for document generation. "
-        "Do not shorten or generalize the memo's content — carry its extreme specificity and reasoning into each field. "
-        "Strictly output a JSON object with these EXACT keys:\n"
-        "- business_name (string)\n"
-        "- market (string)\n"
-        "- what_we_are_doing (string, 2-3 paragraphs explaining the foundational SEO and hub-and-spoke blueprint)\n"
-        "- why_necessary (string, 2-3 paragraphs explaining why this is needed, citing specific ICPs and search terms)\n"
-        "- business_goals (array of objects: {\"driver\": string, \"how_seo_achieves_this\": string})\n"
-        "- structure_value (string, explaining why flat structure fails and hub-and-spoke succeeds for this client)\n"
-        "- icps (array of strings)\n"
-        "- pages (array of objects representing the URL plan. Each object must have: "
-        "\"type\" [e.g., Country Hub, Service Hub, Area Page, S×L], "
-        "\"proposed_url\", \"main_keyword\", \"title_patterned\", \"h1_patterned\", "
-        "\"phase\" [e.g., P0, P1, P2], \"policy\" [Scale, Pilot, Parked])\n"
-        "- next_steps (array of strings)\n"
-        "- meta (array of objects for the excel sheet: \"page_name\", \"url\", \"meta_title\" [<=60 chars, MUST include brand name], "
-        "\"meta_description\" [<=155 chars, MUST end with a strong Call to Action], \"h1\", \"primary_keywords\" [string, comma separated], \"search_intent\" [e.g., Commercial, Informational, Navigational])\n"
-        "Respond with ONLY the valid JSON object."
-    )
-    user = f"ORIGINAL BRIEF:\n{brief_text}\n\nSTRATEGIST'S RESEARCH MEMO:\n{research_memo}"
-    prompt = f"{system}\n\n{user}"
-    
-    print("Calling Gemini API for assembly_pass...")
-    config = genai.GenerationConfig(response_mime_type="application/json")
-    resp = generate_with_retry(prompt, config=config)
-    print("assembly_pass complete.")
-    
-    text = resp.text.strip()
-    if text.startswith("```json"):
-        text = text[7:]
-    if text.startswith("```"):
-        text = text[3:]
-    if text.endswith("```"):
-        text = text[:-3]
-        
-    return json.loads(text.strip())
+# ──────────────────────────────────────────────────────────────────
+# Sidebar
+# ──────────────────────────────────────────────────────────────────
+with st.sidebar:
+    st.title("🔍 Grovuu SEO Agent")
+    st.caption("Evidence-based SEO analysis, strategy, and implementation")
 
-def validate_plan(plan: dict) -> list[str]:
-    """Basic quality gate — catches thin or broken output before it reaches her."""
-    issues = []
-    required = ["business_name", "what_we_are_doing", "why_necessary",
-                "business_goals", "pages", "meta"]
-    for key in required:
-        if not plan.get(key):
-            issues.append(f"Missing or empty field: {key}")
-    if len(plan.get("pages", [])) < 3:
-        issues.append("Fewer than 3 pages generated — likely too shallow")
-    keywords = [p.get("primary_keyword", p.get("main_keyword")) for p in plan.get("pages", [])]
-    if len(keywords) != len(set(keywords)):
-        issues.append("Duplicate primary keywords across pages — risk of keyword cannibalization")
-    for m in plan.get("meta", []):
-        if len(m.get("meta_title", "")) > 60:
-            issues.append(f"Meta title too long for {m.get('url')}")
-        if len(m.get("meta_description", "")) > 155:
-            issues.append(f"Meta description too long for {m.get('url')}")
-    return issues
-
-def content_pass(brief_text: str, plan: dict) -> dict:
-    """Takes the top 5 core pages from the plan and generates HTML individually for extremely high quality."""
-    print("Starting content_pass...")
-    pages = plan.get("pages", [])
-    
-    # Sort pages to prioritize core pages (e.g., P0 or Country Hubs). Limit to 5.
-    def sort_key(p):
-        return p.get("phase", "P9")
-        
-    sorted_pages = sorted(pages, key=sort_key)[:5]
-    if not sorted_pages:
-        return {}
-        
-    html_pages = {}
-    
-    for i, page in enumerate(sorted_pages, start=1):
-        # Construct a safe filename based on the URL or Name
-        url = page.get("proposed_url", "")
-        if url.startswith("/"): url = url[1:]
-        if url.endswith("/"): url = url[:-1]
-        
-        page_name = url.replace("/", "_") if url else page.get("main_keyword", "index").replace(" ", "_")
-        safe_name = f"{page_name}.html"
-            
-        system = (
-            "You are an expert SEO Content Writer and Web Developer. "
-            "Write the complete, semantic HTML5 page for the following page brief. "
-            "REQUIREMENTS:\n"
-            "- Output ONLY raw HTML code (no markdown formatting blocks like ```html around it, just the raw HTML).\n"
-            "- Include <head> with proper meta title and description.\n"
-            "- Use the provided H1.\n"
-            "- Structure the body content professionally with H2s, H3s, paragraphs, and lists.\n"
-            "- Write EXTREMELY detailed, persuasive, human-centric B2B copy satisfying the target keyword's search intent. Be thorough.\n"
-            "- Do not use generic filler (lorem ipsum); write actual comprehensive B2B copy based on the client brief.\n"
-        )
-        
-        meta_desc = ""
-        meta_title = page.get("title_patterned", "")
-        for m in plan.get("meta", []):
-            if m.get("url") == page.get("proposed_url"):
-                meta_desc = m.get("meta_description", "")
-                if not meta_title:
-                    meta_title = m.get("meta_title", "")
-                break
-                
-        user = (
-            f"CLIENT BRIEF:\n{brief_text}\n\n"
-            f"PAGE REQUIREMENTS:\n"
-            f"- Page Type: {page.get('type')}\n"
-            f"- Proposed URL: {page.get('proposed_url')}\n"
-            f"- Primary Keyword: {page.get('main_keyword')}\n"
-            f"- Meta Title: {meta_title}\n"
-            f"- Meta Description: {meta_desc}\n"
-            f"- H1: {page.get('h1_patterned')}\n\n"
-            f"Generate the full, extensive semantic HTML."
-        )
-        
-        prompt = f"{system}\n\n{user}"
-        print(f"Calling Gemini API for HTML generation ({i}/5) - {safe_name}...")
-        resp = generate_with_retry(prompt)
-        print(f"HTML generation complete for {safe_name}.")
-        text = resp.text.strip()
-        if text.startswith("```html"):
-            text = text[7:]
-        if text.startswith("```"):
-            text = text[3:]
-        if text.endswith("```"):
-            text = text[:-3]
-            
-        html_pages[safe_name] = text.strip()
-        
-    return html_pages
-
-def render_docx(plan: dict) -> bytes:
-    if not os.path.exists(DOCX_TEMPLATE_PATH):
-        raise FileNotFoundError(f"Template '{DOCX_TEMPLATE_PATH}' not found in directory.")
-    doc = DocxTemplate(DOCX_TEMPLATE_PATH)
-    doc.render(plan)
-    buf = io.BytesIO()
-    doc.save(buf)
-    return buf.getvalue()
-
-def render_excel_meta(meta_rows: list) -> bytes:
-    wb = Workbook()
-    ws = wb.active
-    ws.title = "Meta Data - Final"
-    ws.append(META_COLUMNS)
-    
-    # Format Headers
-    header_fill = PatternFill(start_color="1F4E78", end_color="1F4E78", fill_type="solid")
-    header_font = Font(color="FFFFFF", bold=True)
-    for cell in ws[1]:
-        cell.fill = header_fill
-        cell.font = header_font
-        cell.alignment = Alignment(horizontal="center", vertical="center")
-        
-    for i, row in enumerate(meta_rows, start=1):
-        pk = row.get("primary_keywords", "")
-        if isinstance(pk, list):
-            pk = ", ".join(pk)
-        ws.append([i, row.get("page_name", ""), row.get("url", ""),
-                   row.get("meta_title", ""), row.get("meta_description", ""),
-                   row.get("h1", ""), pk, row.get("search_intent", "")])
-                   
-    # Auto-adjust column widths and wrap text
-    for col in ws.columns:
-        max_length = 0
-        column = col[0].column_letter
-        for cell in col:
-            try:
-                if len(str(cell.value)) > max_length:
-                    max_length = len(str(cell.value))
-            except:
-                pass
-            cell.alignment = Alignment(wrap_text=True, vertical="top")
-        
-        adjusted_width = max_length + 2
-        if adjusted_width > 50: 
-            adjusted_width = 50  # Cap width so descriptions don't make the column infinite
-        ws.column_dimensions[column].width = adjusted_width
-
-    buf = io.BytesIO()
-    wb.save(buf)
-    return buf.getvalue()
-
-def render_html_zip(html_pages: dict) -> bytes:
-    buf = io.BytesIO()
-    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
-        for filename, content in html_pages.items():
-            zf.writestr(filename, content)
-    return buf.getvalue()
-
-st.title("✨ Grovuu SEO Plan Generator")
-st.markdown("Upload the client brief, add anything extra, get your Strategy, Meta Data, and HTML content.")
-
-# Initialize session state for generated files
-if "docx_buffer" not in st.session_state:
-    st.session_state.docx_buffer = None
-if "xlsx_buffer" not in st.session_state:
-    st.session_state.xlsx_buffer = None
-if "zip_buffer" not in st.session_state:
-    st.session_state.zip_buffer = None
-if "plan_data" not in st.session_state:
-    st.session_state.plan_data = None
-if "issues" not in st.session_state:
-    st.session_state.issues = None
-
-st.divider()
-
-with st.container():
-    with st.form("generation_form", border=True):
-        st.subheader("1. Provide Input")
-        uploaded = st.file_uploader("Client brief document", type=["docx", "pdf", "txt", "md"], help="Supported formats: DOCX, PDF, TXT, MD")
-        extra_requirements = st.text_area("Extra requirements (optional)", height=100)
-        
-        submitted = st.form_submit_button("Generate Outputs", type="primary", use_container_width=True)
-
-if submitted:
-    # Clear previous results
-    st.session_state.docx_buffer = None
-    st.session_state.xlsx_buffer = None
-    st.session_state.zip_buffer = None
-    st.session_state.plan_data = None
-    st.session_state.issues = None
-
-    if not uploaded:
-        st.error("⚠️ Please upload a client brief before generating.")
-    else:
-        try:
-            with st.status("Processing your request...", expanded=True) as status:
-                st.write("📄 Extracting text from document...")
-                brief_text = extract_text(uploaded)
-                
-                st.write("🧠 Research Pass: Analyzing market & strategy (this takes a few minutes)...")
-                research_memo = research_pass(brief_text, extra_requirements)
-                
-                st.write("🧩 Assembly Pass: Structuring the strategy into templates...")
-                plan = assembly_pass(brief_text, research_memo)
-                
-                st.write("✅ Validating output quality...")
-                issues = validate_plan(plan)
-                
-                st.write("🌐 Content Pass: Generating Developer HTML for Top 5 Pages...")
-                html_pages = content_pass(brief_text, plan)
-                
-                st.write("🛠️ Creating Word, Excel, and ZIP output files...")
-                st.session_state.docx_buffer = render_docx(plan)
-                st.session_state.xlsx_buffer = render_excel_meta(plan.get("meta", []))
-                st.session_state.zip_buffer = render_html_zip(html_pages)
-                st.session_state.plan_data = plan
-                st.session_state.issues = issues
-                
-                status.update(label="Generation Complete!", state="complete", expanded=False)
-        except Exception as e:
-            st.error(f"❌ An error occurred: {e}")
-
-if st.session_state.docx_buffer and st.session_state.xlsx_buffer and st.session_state.zip_buffer:
     st.divider()
-    
-    if st.session_state.issues:
-        st.warning("⚠️ Quality check flagged some issues — review before sending:")
-        for issue in st.session_state.issues:
-            st.write(f"- {issue}")
-    else:
-        st.success("✅ Done! No quality issues flagged. Download both files below.")
 
-    st.subheader("🎉 2. Download Your Files")
-    
-    plan = st.session_state.plan_data
-    safe_name = plan.get('business_name', 'SEO_Strategy').replace(" ", "_")
-    
-    col1, col2, col3 = st.columns(3)
-    with col1:
+    # --- Quick Inspect ---
+    st.subheader("🌐 Inspect a Page")
+    inspect_url = st.text_input(
+        "URL", placeholder="https://example.com/page", label_visibility="collapsed",
+    )
+    if st.button("Inspect Page", use_container_width=True, type="primary"):
+        if inspect_url:
+            st.session_state.messages.append(
+                {"role": "user", "content": f"Run a full on-page SEO audit on this URL: {inspect_url}"}
+            )
+            st.session_state.needs_response = True
+            save_state()
+            st.rerun()
+        else:
+            st.warning("Enter a URL first.")
+
+    st.divider()
+
+    # --- File Upload ---
+    st.subheader("📄 Upload Document")
+    uploaded = st.file_uploader(
+        "Client brief, GSC export, or crawl data",
+        type=["docx", "pdf", "txt", "md"],
+        label_visibility="collapsed",
+    )
+    if uploaded:
+        if st.session_state.uploaded_filename != uploaded.name:
+            try:
+                text = extract_text(uploaded)
+                st.session_state.uploaded_text = text
+                st.session_state.uploaded_filename = uploaded.name
+                save_state()
+                st.success(f"Loaded: {uploaded.name} ({len(text):,} chars)")
+            except Exception as e:
+                st.error(f"Could not read file: {e}")
+        else:
+            st.info(f"Loaded: {uploaded.name}")
+
+    if st.session_state.uploaded_text:
+        col_a, col_b = st.columns(2)
+        with col_a:
+            if st.button("📋 Strategy", use_container_width=True, help="Generate full SEO strategy"):
+                brief_preview = st.session_state.uploaded_text[:2000]
+                st.session_state.messages.append(
+                    {"role": "user", "content": f"Generate a comprehensive SEO strategy from this client brief:\n\n{brief_preview}..."}
+                )
+                st.session_state.needs_response = True
+                st.session_state._run_strategy = True
+                save_state()
+                st.rerun()
+        with col_b:
+            if st.button("💬 Discuss", use_container_width=True, help="Ask about the uploaded document"):
+                brief_preview = st.session_state.uploaded_text[:2000]
+                st.session_state.messages.append(
+                    {"role": "user", "content": f"I have uploaded a client document. Here is the content for context:\n\n{brief_preview}\n\n...What questions should we address first?"}
+                )
+                st.session_state.needs_response = True
+                save_state()
+                st.rerun()
+
+    st.divider()
+
+    # --- Downloads ---
+    st.subheader("📊 Downloads")
+    has_downloads = False
+
+    if st.session_state.last_inspection:
+        has_downloads = True
+        report_html = generate_audit_report(st.session_state.last_inspection)
         st.download_button(
-            label="📄 SEO Strategy (.docx)",
-            data=st.session_state.docx_buffer,
-            file_name=f"{safe_name}_strategy.docx",
+            "🔍 HTML Audit Report",
+            data=report_html, file_name="seo_audit_report.html",
+            mime="text/html", use_container_width=True,
+        )
+
+    if st.session_state.strategy_docx:
+        has_downloads = True
+        st.download_button(
+            "📄 Strategy (.docx)",
+            data=st.session_state.strategy_docx, file_name="seo_strategy.docx",
             mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
             use_container_width=True,
-            type="primary"
         )
-    with col2:
+
+    if st.session_state.strategy_xlsx:
+        has_downloads = True
         st.download_button(
-            label="📊 Meta Data (.xlsx)",
-            data=st.session_state.xlsx_buffer,
-            file_name=f"{safe_name}_meta_data.xlsx",
+            "📊 Meta Data (.xlsx)",
+            data=st.session_state.strategy_xlsx, file_name="seo_meta_data.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             use_container_width=True,
-            type="primary"
         )
-    with col3:
+
+    if st.session_state.strategy_zip:
+        has_downloads = True
         st.download_button(
-            label="🖥️ Developer HTML (.zip)",
-            data=st.session_state.zip_buffer,
-            file_name=f"{safe_name}_html_content.zip",
-            mime="application/zip",
-            use_container_width=True,
-            type="primary"
+            "🖥️ HTML Pages (.zip)",
+            data=st.session_state.strategy_zip, file_name="seo_html_content.zip",
+            mime="application/zip", use_container_width=True,
         )
+
+    if not has_downloads:
+        st.caption("Reports will appear here after analysis.")
+
+    st.divider()
+
+    if st.button("🗑️ New Conversation", use_container_width=True):
+        if os.path.exists(STATE_FILE):
+            os.remove(STATE_FILE)
+        for key, val in defaults.items():
+            st.session_state[key] = val if not isinstance(val, list) else []
+        st.rerun()
+
+
+# ──────────────────────────────────────────────────────────────────
+# Chat display
+# ──────────────────────────────────────────────────────────────────
+for msg in st.session_state.messages:
+    with st.chat_message(msg["role"]):
+        st.markdown(msg["content"])
+
+# Welcome message
+if not st.session_state.messages:
+    with st.chat_message("assistant"):
+        st.markdown("Ready. Paste a URL below to begin an audit, or upload a brief in the sidebar to generate a strategy.")
+
+
+# ──────────────────────────────────────────────────────────────────
+# Response generation
+# ──────────────────────────────────────────────────────────────────
+
+def _run_strategy_pipeline():
+    """Run the full strategy generation pipeline."""
+    brief = st.session_state.uploaded_text
+    if not brief:
+        return "No client brief uploaded. Please upload a document in the sidebar."
+
+    with st.status("Generating SEO strategy...", expanded=True) as status:
+        st.write("🧠 Strategy pass: analyzing brief and structuring plan...")
+        plan = assembly_pass(client, MODEL_NAME, brief)
+
+        st.write("✅ Validating output quality...")
+        issues = validate_plan(plan)
+
+        st.write("🌐 Content pass: generating HTML for top 3 pages...")
+        html_pages = content_pass(client, MODEL_NAME, brief, plan)
+
+        st.write("📦 Packaging deliverables...")
+        st.session_state.strategy_docx = render_docx(plan)
+        st.session_state.strategy_xlsx = render_excel_meta(plan.get("meta", []))
+
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+            for filename, content in html_pages.items():
+                zf.writestr(filename, content)
+        st.session_state.strategy_zip = buf.getvalue()
+
+        status.update(label="Strategy complete!", state="complete", expanded=False)
+
+    result = f"**SEO strategy generated for {plan.get('business_name', 'the client')}.**\n\n"
+    if issues:
+        result += "⚠️ **Quality checks flagged:**\n"
+        for issue in issues:
+            result += f"- {issue}\n"
+        result += "\n"
+    result += (
+        f"**Deliverables ready** (download from sidebar):\n"
+        f"- 📄 Strategy document (.docx)\n"
+        f"- 📊 Meta data sheet (.xlsx) with {len(plan.get('meta', []))} pages\n"
+        f"- 🖥️ HTML content (.zip) with {len(html_pages)} pages\n\n"
+        f"**Pages planned:** {len(plan.get('pages', []))}\n"
+        f"**ICPs identified:** {len(plan.get('icps', []))}\n\n"
+        f"You can now ask me questions about the strategy, request changes, or proceed with implementation."
+    )
+    return result
+
+
+def generate_with_retry_chat(client, model_name, history, config, retries=5):
+    """Wrapper to handle 503s and pace chat requests."""
+    for attempt in range(retries):
+        try:
+            time.sleep(4.5) # Enforce 15 RPM limit
+            return client.models.generate_content(
+                model=model_name,
+                contents=history,
+                config=config,
+            )
+        except Exception as e:
+            error_str = str(e)
+            if attempt < retries - 1 and any(code in error_str for code in ["429", "503", "UNAVAILABLE"]):
+                sleep_time = 15 * (attempt + 1)
+                st.toast(f"Model busy (503/429). Retrying in {sleep_time}s...", icon="⏳")
+                time.sleep(sleep_time)
+            else:
+                raise
+
+def _generate_response(user_message: str) -> str:
+    """Generate a response with tool calling and UI feedback."""
+
+    # Strategy pipeline
+    if st.session_state._run_strategy:
+        st.session_state._run_strategy = False
+        return _run_strategy_pipeline()
+
+    # Build config
+    config = types.GenerateContentConfig(
+        system_instruction=system_prompt,
+        tools=TOOL_DECLARATIONS,
+    )
+
+    # Add user message to genai history
+    st.session_state.genai_history.append(
+        types.Content(role="user", parts=[types.Part.from_text(text=user_message)])
+    )
+
+    # Call Gemini
+    response = generate_with_retry_chat(client, MODEL_NAME, st.session_state.genai_history, config)
+
+    # Handle function calls in a loop
+    for _ in range(5):
+        function_calls = []
+        try:
+            if response.candidates and response.candidates[0].content:
+                for part in response.candidates[0].content.parts:
+                    if part.function_call and part.function_call.name:
+                        function_calls.append(part)
+        except (IndexError, AttributeError):
+            break
+
+        if not function_calls:
+            break
+
+        # Record model response in history
+        st.session_state.genai_history.append(response.candidates[0].content)
+
+        # Execute tools with status display
+        response_parts = []
+        for fc_part in function_calls:
+            fc = fc_part.function_call
+            args = dict(fc.args) if fc.args else {}
+            tool_url = args.get("url", "page")
+
+            with st.status(f"🔍 Inspecting {tool_url}...", expanded=True) as status:
+                st.write("Fetching server HTML and extracting SEO evidence...")
+                try:
+                    result = execute_tool_call(fc)
+                    if fc.name == "inspect_page" and "error" not in result:
+                        st.session_state.last_inspection = result
+                        wc = result.get("content", {}).get("serverHtmlWordCount", "?")
+                        lc = result.get("links", {}).get("internalCount", "?")
+                        st.write(f"Found {wc} words, {lc} internal links")
+                    status.update(label=f"✅ Inspected {tool_url}", state="complete", expanded=False)
+                except Exception as e:
+                    result = {"error": str(e)}
+                    status.update(label=f"❌ Failed: {tool_url}", state="error", expanded=False)
+
+            response_parts.append(
+                types.Part.from_function_response(
+                    name=fc.name,
+                    response={"result": json.dumps(result, default=str)},
+                )
+            )
+
+        # Send tool results back
+        st.session_state.genai_history.append(
+            types.Content(role="user", parts=response_parts)
+        )
+        response = generate_with_retry_chat(client, MODEL_NAME, st.session_state.genai_history, config)
+
+    # Record final response
+    if response.candidates and response.candidates[0].content:
+        st.session_state.genai_history.append(response.candidates[0].content)
+
+    try:
+        return response.text
+    except Exception:
+        return "Analysis complete but I could not generate a text summary. Please try rephrasing your request."
+
+
+# ──────────────────────────────────────────────────────────────────
+# Process pending response
+# ──────────────────────────────────────────────────────────────────
+if st.session_state.needs_response and st.session_state.messages:
+    st.session_state.needs_response = False
+    last_msg = st.session_state.messages[-1]
+
+    if last_msg["role"] == "user":
+        with st.chat_message("assistant"):
+            try:
+                response_text = _generate_response(last_msg["content"])
+                st.markdown(response_text)
+                st.session_state.messages.append({"role": "assistant", "content": response_text})
+            except Exception as e:
+                error_text = f"❌ Error: {e}"
+                st.error(error_text)
+                st.session_state.messages.append({"role": "assistant", "content": error_text})
+        save_state()
+        st.rerun()
+
+# Chat input
+if prompt := st.chat_input("Ask anything about SEO, or paste a URL to audit..."):
+    st.session_state.messages.append({"role": "user", "content": prompt})
+    st.session_state.needs_response = True
+    save_state()
+    st.rerun()
