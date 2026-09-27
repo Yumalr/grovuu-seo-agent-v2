@@ -9,6 +9,8 @@ import time
 from google import genai
 from google.genai import types
 
+from agent.prompts import build_system_prompt
+
 
 def generate_with_retry(client, model_name, prompt, config=None, retries=5):
     """Wrapper to handle 429 (Rate Limits) and 503 (Unavailable) gracefully.
@@ -42,9 +44,11 @@ def generate_with_retry(client, model_name, prompt, config=None, retries=5):
 
 def assembly_pass(client, model_name, brief_text: str) -> dict:
     """Produces the complete strategy plan in a single request."""
+    skill_rules = build_system_prompt()
+    
     system = (
-        "You are a senior SEO strategist at a boutique consultancy. You are designing a "
-        "market-entry SEO strategy for a client. You convert the brief into a structured JSON object.\n\n"
+        f"{skill_rules}\n\n"
+        "You are designing a market-entry SEO strategy for a client. You convert the brief into a structured JSON object.\n\n"
         "STRATEGY REQUIREMENTS:\n"
         "- Think through the client's Ideal Customer Profiles (ICPs).\n"
         "- Detail why a 'flat' website structure fails and propose a 'Hub-and-Spoke' architecture.\n"
@@ -118,14 +122,17 @@ def content_pass(client, model_name, brief_text: str, plan: dict) -> dict:
     if not sorted_pages:
         return {}
 
+    skill_rules = build_system_prompt()
+    
     system = (
+        f"{skill_rules}\n\n"
         "You are an expert SEO Content Writer and Web Developer. "
         "Write the complete, semantic HTML5 pages for the following page briefs. "
         "REQUIREMENTS:\n"
         "- Include <head> with proper meta title and description.\n"
         "- Use the provided H1.\n"
         "- Structure with H2s, H3s, paragraphs, and lists.\n"
-        "- Write detailed, persuasive B2B copy.\n"
+        "- Write detailed, persuasive B2B copy. Strictly follow the tone and style rules in the rulebook.\n"
         "- Strictly output a JSON dictionary where the keys are filenames (e.g. 'page1.html') and values are the raw HTML strings.\n"
     )
 
